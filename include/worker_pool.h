@@ -27,7 +27,7 @@ private:
 
         float thread_local_sum = 0.0f;
 
-        while (true) {
+        /*while (true) {
             // 2. TICKET PRE-RESERVATION
             // Multi-thread atomic reservation handles index mapping concurrently.
             // acq_rel prevents reads/writes from reordering across the allocation frontier.
@@ -66,6 +66,36 @@ private:
             // Advance the slot's tracking sequence token forward by the RingBufferLen.
             // This signals to the producer that this memory slot is clear to be overwritten.
             target_slot.sequence.store(reserved_ticket + RingBufferLen, std::memory_order_release);
+        }*/
+        
+        constexpr std::uint32_t LocalBatchSize = 64; // Reserve 64 slots at a time
+
+        while (true) {
+            // 1. BATCH RESERVATION: Fetch 64 slots at once, cutting atomic traffic by 64x
+            std::uint32_t base_ticket = queue->readIdx.fetch_add(LocalBatchSize, std::memory_order_acq_rel);
+
+            // 2. Process the local batch sequentially
+            for (std::uint32_t b = 0; b < LocalBatchSize; ++b) {
+                std::uint32_t reserved_ticket = base_ticket + b;
+                std::uint32_t slot_index = reserved_ticket % RingBufferLen;
+                Slot& target_slot = queue->store[slot_index];
+
+                // 3. Generational Spin Wait (Stays local to this slot's cache line)
+                std::uint32_t expected_sequence = reserved_ticket + 1;
+                while (target_slot.sequence.load(std::memory_order_acquire) != expected_sequence) {
+                    // Exit logic
+                    if (queue->done.load(std::memory_order_acquire) && 
+                        queue->writeIdx.load(std::memory_order_acquire) <= reserved_ticket) {
+                        global_sum.fetch_add(thread_local_sum, std::memory_order_relaxed);
+                        return;
+                    }
+                    _mm_pause();
+                }
+
+                // 4. Read data and release slot generation back to Producer
+                thread_local_sum += target_slot;
+                target_slot.sequence.store(reserved_ticket + RingBufferLen, std::memory_order_release);
+            }
         }
     }
 
