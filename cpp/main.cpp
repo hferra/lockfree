@@ -3,9 +3,9 @@
 #include <chrono>
 #include <pthread.h> // For thread affinity on Linux
 
-#include "lf_queue.h"
-#include "lf_producer.h"
-#include "lf_consumer.h"
+#include "SPMCqueue.h"
+#include "SPMCproducer.h"
+#include "worker_pool.h"
 
 // Helper function to pin a native thread to a specific CPU core
 void pin_thread_to_core(std::thread& th, int core_id) {
@@ -22,7 +22,7 @@ void pin_thread_to_core(std::thread& th, int core_id) {
 
 int main() {
     // 1. Instantiate the shared queue infrastructure
-    Queue shared_queue;
+    SPMCQueue shared_queue;
 
     {
         // 2. Pin the queue memory using RAII
@@ -35,23 +35,22 @@ int main() {
         }
 
         // 4. Instantiate workloads
-        Producer producer(&shared_queue);
-        Consumer consumer(&shared_queue);
+        SPMCProducer producer(&shared_queue);
+        WorkerPool consumers(&shared_queue, 3);
 
         std::cout << "Starting benchmark with RAII-managed memory pinning..." << std::endl;
         auto start_time = std::chrono::high_resolution_clock::now();
 
         // 5. Run execution pathways on isolated cores
-        std::thread producer_thread(&Producer::Run, &producer);
-        std::thread consumer_thread(&Consumer::Run, &consumer);
+        consumers.Start();
+        std::thread producer_thread(&SPMCProducer::Run, &producer);
 
         pin_thread_to_core(producer_thread, 2);
-        pin_thread_to_core(consumer_thread, 4);
 
         // 6. Synchronize and join threads
         producer_thread.join();
         shared_queue.done.store(true, std::memory_order_release);
-        consumer_thread.join();
+        consumers.Shutdown();
 
         auto end_time = std::chrono::high_resolution_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();

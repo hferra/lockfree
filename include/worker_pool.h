@@ -5,7 +5,7 @@
 #include <atomic>
 #include <cstdint>
 #include <immintrin.h> // Required for _mm_pause
-#include "lf_spmc_queue.h"
+#include "SPMCqueue.h"
 
 class WorkerPool {
 private:
