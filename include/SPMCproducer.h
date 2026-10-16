@@ -1,6 +1,7 @@
 #pragma once
 
 #include <thread>
+#include <future>
 #include <random>
 #include <immintrin.h> // Required for _mm_pause
 
@@ -21,7 +22,7 @@ class SPMCProducer
     , count(0)
     {}
 
-    void Run()
+    void Run(std::promise<std::uint32_t> output_promise)
     {
         std::random_device rd;
         std::mt19937 gen(rd());
@@ -62,6 +63,7 @@ class SPMCProducer
             count++;
             queue->writeIdx.store(count, std::memory_order_release);
         }
+        output_promise.set_value(totalCount);
     }
 
     private:

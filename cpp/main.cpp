@@ -1,7 +1,9 @@
 #include <iostream>
 #include <thread>
+#include <future>
 #include <chrono>
 #include <pthread.h> // For thread affinity on Linux
+#include <cassert>
 
 #include "SPMCqueue.h"
 #include "SPMCproducer.h"
@@ -23,6 +25,8 @@ void pin_thread_to_core(std::thread& th, int core_id) {
 int main() {
     // 1. Instantiate the shared queue infrastructure
     SPMCQueue shared_queue;
+    std::promise<std::uint32_t> producer_promise;
+    std::future<std::uint32_t> producer_future = producer_promise.get_future();
 
     {
         // 2. Pin the queue memory using RAII
@@ -43,19 +47,21 @@ int main() {
 
         // 5. Run execution pathways on isolated cores
         consumers.Start();
-        std::thread producer_thread(&SPMCProducer::Run, &producer);
+        std::thread producer_thread(&SPMCProducer::Run, &producer, std::move(producer_promise));
 
         pin_thread_to_core(producer_thread, 2);
 
         // 6. Synchronize and join threads
         producer_thread.join();
+        std::uint32_t totalWork = producer_future.get();
         shared_queue.done.store(true, std::memory_order_release);
-        consumers.Shutdown();
+        std::uint32_t workDone = consumers.Shutdown();
 
         auto end_time = std::chrono::high_resolution_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
 
         std::cout << "Benchmark complete! Elapsed time: " << elapsed << " ms" << std::endl;
+        assert(totalWork == workDone);
         
     } // <-- queue_lock automatically goes out of scope here and calls munlock()!
 

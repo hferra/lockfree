@@ -1,6 +1,7 @@
 #pragma once
 
 #include <thread>
+#include <future>
 #include <vector>
 #include <atomic>
 #include <cstdint>
@@ -11,13 +12,16 @@ class WorkerPool {
 private:
     SPMCQueue* queue;
     std::vector<std::thread> workers;
+    std::vector<std::promise<std::uint32_t>> worker_promise;
+    std::vector<std::future<std::uint32_t>> worker_future;
     std::size_t num_threads;
     
     // Aligned monitoring accumulator to aggregate local worker throughput
     alignas(64) std::atomic<float> global_sum{0.0f};
 
     // The core hot-path execution loop run by every thread in the pool
-    void WorkerLoop(int worker_id) {
+    void WorkerLoop(int worker_id, std::promise<std::uint32_t> output_promise) {
+        std::uint32_t count = 0;
         // 1. PIN THE THREAD
         // For performance determinism, pin each worker to its own isolated CPU core
         cpu_set_t cpuset;
@@ -87,6 +91,7 @@ private:
                     if (queue->done.load(std::memory_order_acquire) && 
                         queue->writeIdx.load(std::memory_order_acquire) <= reserved_ticket) {
                         global_sum.fetch_add(thread_local_sum, std::memory_order_relaxed);
+                        output_promise.set_value(count);
                         return;
                     }
                     _mm_pause();
@@ -94,6 +99,7 @@ private:
 
                 // 4. Read data and release slot generation back to Producer
                 thread_local_sum += target_slot;
+                count++;
                 target_slot.sequence.store(reserved_ticket + RingBufferLen, std::memory_order_release);
             }
         }
@@ -105,6 +111,14 @@ public:
         , num_threads(threads) 
     {
         workers.reserve(num_threads);
+        worker_promise.reserve(num_threads);
+        worker_future.reserve(num_threads);
+        for(std::size_t i = 0; i < num_threads; ++i)
+        {
+            std::promise<std::uint32_t> p;
+            worker_future.push_back(p.get_future());
+            worker_promise.push_back(std::move(p));
+        }
     }
 
     ~WorkerPool() {
@@ -114,18 +128,24 @@ public:
     // Spawns the worker threads and kicks off execution loops
     void Start() {
         for (std::size_t i = 0; i < num_threads; ++i) {
-            workers.emplace_back(&WorkerPool::WorkerLoop, this, static_cast<int>(i));
+            workers.emplace_back(&WorkerPool::WorkerLoop, this, static_cast<int>(i), std::move(worker_promise[i]));
         }
     }
 
     // Synchronizes the pool threads during teardown
-    void Shutdown() {
+    std::uint32_t Shutdown() {
+        std::uint32_t ret = 0;
+        int i = 0;
         for (auto& th : workers) {
             if (th.joinable()) {
                 th.join();
+                ret += worker_future[i].get();
+                i++;
             }
         }
         workers.clear();
+        worker_future.clear();
+        return ret;
     }
 
     [[nodiscard]] float GetTotalSum() const noexcept {
