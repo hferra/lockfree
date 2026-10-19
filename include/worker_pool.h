@@ -20,7 +20,7 @@ private:
     alignas(64) std::atomic<float> global_sum{0.0f};
 
     // The core hot-path execution loop run by every thread in the pool
-    void WorkerLoop(int worker_id, std::promise<std::uint32_t> output_promise) {
+    void WorkerLoop(int worker_id, std::uint32_t num_threads, std::promise<std::uint32_t> output_promise) {
         std::uint32_t count = 0;
         // 1. PIN THE THREAD
         // For performance determinism, pin each worker to its own isolated CPU core
@@ -30,6 +30,7 @@ private:
         pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
 
         float thread_local_sum = 0.0f;
+        std::uint32_t block = 0;
 
         /*while (true) {
             // 2. TICKET PRE-RESERVATION
@@ -72,11 +73,14 @@ private:
             target_slot.sequence.store(reserved_ticket + RingBufferLen, std::memory_order_release);
         }*/
         
-        constexpr std::uint32_t LocalBatchSize = 64; // Reserve 64 slots at a time
+        constexpr std::uint32_t LocalBatchSize = 128; // Reserve N slots at a time
 
         while (true) {
             // 1. BATCH RESERVATION: Fetch 64 slots at once, cutting atomic traffic by 64x
-            std::uint32_t base_ticket = queue->readIdx.fetch_add(LocalBatchSize, std::memory_order_acq_rel);
+            //std::uint32_t base_ticket = queue->readIdx.fetch_add(LocalBatchSize, std::memory_order_acq_rel);
+            std::uint32_t base_ticket = (block * num_threads + worker_id) * LocalBatchSize;
+            
+
 
             // 2. Process the local batch sequentially
             for (std::uint32_t b = 0; b < LocalBatchSize; ++b) {
@@ -102,6 +106,7 @@ private:
                 count++;
                 target_slot.sequence.store(reserved_ticket + RingBufferLen, std::memory_order_release);
             }
+            block++;
         }
     }
 
@@ -128,7 +133,7 @@ public:
     // Spawns the worker threads and kicks off execution loops
     void Start() {
         for (std::size_t i = 0; i < num_threads; ++i) {
-            workers.emplace_back(&WorkerPool::WorkerLoop, this, static_cast<int>(i), std::move(worker_promise[i]));
+            workers.emplace_back(&WorkerPool::WorkerLoop, this, static_cast<int>(i), static_cast<std::uint32_t>(num_threads), std::move(worker_promise[i]));
         }
     }
 
