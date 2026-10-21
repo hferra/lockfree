@@ -4,6 +4,7 @@
 #include <chrono>
 #include <pthread.h> // For thread affinity on Linux
 #include <cassert>
+#include <algorithm>
 
 #include "SPMCqueue.h"
 #include "SPMCproducer.h"
@@ -23,47 +24,73 @@ void pin_thread_to_core(std::thread& th, int core_id) {
 }
 
 int main() {
-    // 1. Instantiate the shared queue infrastructure
-    SPMCQueue shared_queue;
-    std::promise<std::uint32_t> producer_promise;
-    std::future<std::uint32_t> producer_future = producer_promise.get_future();
+    constexpr size_t total_bench_runs = 1000;
+    std::vector<double> timings;
+    timings.reserve(total_bench_runs);
 
-    {
-        // 2. Pin the queue memory using RAII
-        // The lock remains active for the entire duration of this execution block
-        ScopedMemoryLock queue_lock(&shared_queue, sizeof(shared_queue));
+    for (size_t run = 0; run < total_bench_runs; ++run) {
 
-        // 3. Warm up the buffer while securely pinned in physical RAM
-        for (size_t i = 0; i < RingBufferLen; ++i) {
-            shared_queue.store[i] = 0.0f; 
-        }
+        // 1. Instantiate the shared queue infrastructure
+        SPMCQueue shared_queue;
+        std::promise<std::uint32_t> producer_promise;
+        std::future<std::uint32_t> producer_future = producer_promise.get_future();
 
-        // 4. Instantiate workloads
-        SPMCProducer producer(&shared_queue);
-        WorkerPool consumers(&shared_queue, 3);
+        {
+            // 2. Pin the queue memory using RAII
+            // The lock remains active for the entire duration of this execution block
+            ScopedMemoryLock queue_lock(&shared_queue, sizeof(shared_queue));
 
-        std::cout << "Starting benchmark with RAII-managed memory pinning..." << std::endl;
-        auto start_time = std::chrono::high_resolution_clock::now();
+            // 3. Warm up the buffer while securely pinned in physical RAM
+            for (size_t i = 0; i < RingBufferLen; ++i) {
+                shared_queue.store[i] = 0.0f; 
+            }
 
-        // 5. Run execution pathways on isolated cores
-        consumers.Start();
-        std::thread producer_thread(&SPMCProducer::Run, &producer, std::move(producer_promise));
+            // 4. Instantiate workloads
+            SPMCProducer producer(&shared_queue);
+            WorkerPool consumers(&shared_queue, 3);
 
-        pin_thread_to_core(producer_thread, 2);
+            std::cout << "Starting benchmark with RAII-managed memory pinning " << run << "..." << std::endl;
+            auto start_time = std::chrono::high_resolution_clock::now();
 
-        // 6. Synchronize and join threads
-        producer_thread.join();
-        std::uint32_t totalWork = producer_future.get();
-        shared_queue.done.store(true, std::memory_order_release);
-        std::uint32_t workDone = consumers.Shutdown();
+            // 5. Run execution pathways on isolated cores
+            consumers.Start();
+            std::thread producer_thread(&SPMCProducer::Run, &producer, std::move(producer_promise));
 
-        auto end_time = std::chrono::high_resolution_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+            pin_thread_to_core(producer_thread, 2);
 
-        std::cout << "Benchmark complete! Elapsed time: " << elapsed << " ms" << std::endl;
-        assert(totalWork == workDone);
-        
-    } // <-- queue_lock automatically goes out of scope here and calls munlock()!
+            // 6. Synchronize and join threads
+            producer_thread.join();
+            std::uint32_t totalWork = producer_future.get();
+            shared_queue.done.store(true, std::memory_order_release);
+            std::uint32_t workDone = consumers.Shutdown();
+
+            auto end_time = std::chrono::high_resolution_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+            timings.push_back(elapsed);
+
+            //std::cout << "Benchmark complete! Elapsed time: " << elapsed << " ms" << std::endl;
+            assert(totalWork == workDone);
+            
+        } // <-- queue_lock automatically goes out of scope here and calls munlock()!
+    }
+
+    // 1. Calculate Average
+    double sum = std::accumulate(timings.begin(), timings.end(), 0.0);
+    double avg = sum / timings.size();
+
+    // 2. Calculate Standard Deviation
+    double sq_sum = std::inner_product(timings.begin(), timings.end(), timings.begin(), 0.0);
+    double stdev = std::sqrt(sq_sum / timings.size() - avg * avg);
+
+    // 3. Extract Percentiles
+    std::sort(timings.begin(), timings.end());
+    double min_val = timings.front();
+    double max_val = timings.back();
+    double p99 = timings[static_cast<size_t>(total_bench_runs * 0.99)];
+
+    std::cout << "--- Statistical Summary (" << total_bench_runs << " runs) ---" << std::endl;
+    std::cout << "Avg: " << avg << " ms | StdDev: " << stdev << " ms" << std::endl;
+    std::cout << "Min: " << min_val << " ms | p99: " << p99 << " ms | Max: " << max_val << " ms" << std::endl;
 
     return 0;
 }
