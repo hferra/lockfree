@@ -2,6 +2,7 @@
 #include <thread>
 #include <future>
 #include <chrono>
+#include <random>
 #include <pthread.h> // For thread affinity on Linux
 #include <cassert>
 #include <algorithm>
@@ -9,6 +10,26 @@
 #include "SPMCqueue.h"
 #include "SPMCproducer.h"
 #include "worker_pool.h"
+
+// The user defines their custom business logic here
+struct RandomGeneratorPolicy {
+    std::mt19937 gen;
+    std::uniform_real_distribution<float> dis;
+
+    // Explicit constructor to ensure standard initialization works perfectly
+    RandomGeneratorPolicy(std::uint32_t seed) 
+        : gen(seed)
+        , dis(0.0f, 1.0f) 
+    {}
+
+    RandomGeneratorPolicy(RandomGeneratorPolicy&&) noexcept = default;
+    RandomGeneratorPolicy& operator=(RandomGeneratorPolicy&&) noexcept = default;
+
+    // Must return EXACTLY float to satisfy std::same_as<float>
+    [[nodiscard]] inline float Generate() noexcept {
+        return dis(gen);
+    }
+};
 
 // Helper function to pin a native thread to a specific CPU core
 void pin_thread_to_core(std::thread& th, int core_id) {
@@ -29,16 +50,22 @@ int main() {
     timings.reserve(total_bench_runs);
 
     for (size_t run = 0; run < total_bench_runs; ++run) {
-
         // 1. Instantiate the shared queue infrastructure
         SPMCQueue shared_queue;
         std::promise<std::uint32_t> producer_promise;
         std::future<std::uint32_t> producer_future = producer_promise.get_future();
+        std::random_device rd;
 
+        RandomGeneratorPolicy policy(rd());
         {
             // 2. Pin the queue memory using RAII
             // The lock remains active for the entire duration of this execution block
             ScopedMemoryLock queue_lock(&shared_queue, sizeof(shared_queue));
+
+            // 1. Instantiate the shared queue infrastructure
+            SPMCQueue shared_queue;
+            std::promise<std::uint32_t> producer_promise;
+            std::future<std::uint32_t> producer_future = producer_promise.get_future();
 
             // 3. Warm up the buffer while securely pinned in physical RAM
             for (size_t i = 0; i < RingBufferLen; ++i) {
@@ -46,16 +73,19 @@ int main() {
             }
 
             // 4. Instantiate workloads
-            SPMCProducer producer(&shared_queue);
+            SPMCProducer<RandomGeneratorPolicy> producer(&shared_queue);
             WorkerPool consumers(&shared_queue, 3);
+
+
+            // 5. Run execution pathways on isolated cores
+            consumers.Start();
+            std::thread producer_thread(&SPMCProducer<RandomGeneratorPolicy>::Run, &producer, std::move(producer_promise), std::ref(policy));
+        
 
             std::cout << "Starting benchmark with RAII-managed memory pinning " << run << "..." << std::endl;
             auto start_time = std::chrono::high_resolution_clock::now();
 
             // 5. Run execution pathways on isolated cores
-            consumers.Start();
-            std::thread producer_thread(&SPMCProducer::Run, &producer, std::move(producer_promise));
-
             pin_thread_to_core(producer_thread, 2);
 
             // 6. Synchronize and join threads

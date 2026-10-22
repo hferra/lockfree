@@ -2,11 +2,19 @@
 
 #include <thread>
 #include <future>
-#include <random>
+#include <functional>
+#include <concepts>
 #include <immintrin.h> // Required for _mm_pause
 
 #include "SPMCqueue.h"
 
+// Define a C++20 concept to enforce your library's interface at compile-time
+template<typename T>
+concept WorkPolicy = requires(T policy) {
+    { policy.Generate() } -> std::same_as<float>;
+};
+
+template<WorkPolicy Policy>
 class SPMCProducer
 {
     private: 
@@ -22,17 +30,18 @@ class SPMCProducer
     , count(0)
     {}
 
-    void Run(std::promise<std::uint32_t> output_promise)
+    // Compile-time template parameter accepts the raw closure type natively
+    void Run(std::promise<std::uint32_t> output_promise, Policy& policy)
     {
-        std::random_device rd;
+        /*std::random_device rd;
         std::mt19937 gen(rd());
-        std::uniform_real_distribution<float> dis(0.0f, 1.0f);
+        std::uniform_real_distribution<float> dis(0.0f, 1.0f);*/
 
         constexpr std::uint32_t totalCount = RingBufferLen * rounds;
         
         for(std::uint32_t i = 0; i < totalCount; ++i)
         {
-            float random_value = dis(gen);
+            float random_value = policy.Generate(); //dis(gen);
             
             // 1. Map our absolute sequence number to the physical array slot
             std::uint32_t slot_index = count % RingBufferLen;
