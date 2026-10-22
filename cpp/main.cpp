@@ -58,22 +58,18 @@ int main() {
     timings.reserve(total_bench_runs);
 
     for (size_t run = 0; run < total_bench_runs; ++run) {
-        // 1. Instantiate the shared queue infrastructure
-        SPMCQueue shared_queue;
-        std::promise<std::uint32_t> producer_promise;
-        std::future<std::uint32_t> producer_future = producer_promise.get_future();
         std::random_device rd;
 
         RandomGeneratorPolicy policy(rd());
         {
+            // 1. Instantiate the shared queue infrastructure
+            SPMCQueue<float> shared_queue;
+            std::promise<std::uint32_t> producer_promise;
+            std::future<std::uint32_t> producer_future = producer_promise.get_future();
+
             // 2. Pin the queue memory using RAII
             // The lock remains active for the entire duration of this execution block
             ScopedMemoryLock queue_lock(&shared_queue, sizeof(shared_queue));
-
-            // 1. Instantiate the shared queue infrastructure
-            SPMCQueue shared_queue;
-            std::promise<std::uint32_t> producer_promise;
-            std::future<std::uint32_t> producer_future = producer_promise.get_future();
 
             // 3. Warm up the buffer while securely pinned in physical RAM
             for (size_t i = 0; i < RingBufferLen; ++i) {
@@ -81,13 +77,13 @@ int main() {
             }
 
             // 4. Instantiate workloads
-            SPMCProducer<RandomGeneratorPolicy> producer(&shared_queue);
-            WorkerPool<SummationPolicy> consumers(&shared_queue, 3);
+            SPMCProducer<RandomGeneratorPolicy, float> producer(&shared_queue);
+            WorkerPool<SummationPolicy, float> consumers(&shared_queue, 3);
 
 
             // 5. Run execution pathways on isolated cores
             consumers.Start();
-            std::thread producer_thread(&SPMCProducer<RandomGeneratorPolicy>::Run, &producer, std::move(producer_promise), std::ref(policy));
+            std::thread producer_thread(&SPMCProducer<RandomGeneratorPolicy, float>::Run, &producer, std::move(producer_promise), std::ref(policy));
         
 
             std::cout << "Starting benchmark with RAII-managed memory pinning " << run << "..." << std::endl;
