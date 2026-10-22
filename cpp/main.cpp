@@ -12,7 +12,8 @@
 #include "worker_pool.h"
 
 // The user defines their custom business logic here
-struct RandomGeneratorPolicy {
+struct RandomGeneratorPolicy
+{
     std::mt19937 gen;
     std::uniform_real_distribution<float> dis;
 
@@ -28,6 +29,13 @@ struct RandomGeneratorPolicy {
     // Must return EXACTLY float to satisfy std::same_as<float>
     [[nodiscard]] inline float Generate() noexcept {
         return dis(gen);
+    }
+};
+
+struct SummationPolicy
+{
+    inline void Consume(float val, float& sum) noexcept {
+        sum += val;
     }
 };
 
@@ -74,7 +82,7 @@ int main() {
 
             // 4. Instantiate workloads
             SPMCProducer<RandomGeneratorPolicy> producer(&shared_queue);
-            WorkerPool consumers(&shared_queue, 3);
+            WorkerPool<SummationPolicy> consumers(&shared_queue, 3);
 
 
             // 5. Run execution pathways on isolated cores

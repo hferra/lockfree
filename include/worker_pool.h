@@ -6,8 +6,17 @@
 #include <atomic>
 #include <cstdint>
 #include <immintrin.h> // Required for _mm_pause
+#include <concepts>
 #include "SPMCqueue.h"
 
+// Define a C++20 concept to enforce your library's interface at compile-time
+template<typename T>
+concept ConsumePolicy = requires(T policy, float payload, float& sum ) {
+    { policy.Consume(payload, sum) } -> std::same_as<void>;
+};
+
+
+template <ConsumePolicy Policy>
 class WorkerPool {
 private:
     SPMCQueue* queue;
@@ -15,12 +24,13 @@ private:
     std::vector<std::promise<std::uint32_t>> worker_promise;
     std::vector<std::future<std::uint32_t>> worker_future;
     std::size_t num_threads;
+    Policy policy;
     
     // Aligned monitoring accumulator to aggregate local worker throughput
     alignas(64) std::atomic<float> global_sum{0.0f};
 
     // The core hot-path execution loop run by every thread in the pool
-    void WorkerLoop(int worker_id, std::uint32_t num_threads, std::promise<std::uint32_t> output_promise) {
+    void WorkerLoop(int worker_id, std::uint32_t num_threads, std::promise<std::uint32_t> output_promise, Policy& policy) {
         std::uint32_t count = 0;
         // 1. PIN THE THREAD
         // For performance determinism, pin each worker to its own isolated CPU core
@@ -102,7 +112,8 @@ private:
                 }
 
                 // 4. Read data and release slot generation back to Producer
-                thread_local_sum += target_slot;
+                //thread_local_sum += target_slot;
+                policy.Consume(target_slot, thread_local_sum);
                 count++;
                 target_slot.sequence.store(reserved_ticket + RingBufferLen, std::memory_order_release);
             }
@@ -113,7 +124,8 @@ private:
 public:
     WorkerPool(SPMCQueue* q, std::size_t threads) 
         : queue(q)
-        , num_threads(threads) 
+        , num_threads(threads)
+        , policy() 
     {
         workers.reserve(num_threads);
         worker_promise.reserve(num_threads);
@@ -133,7 +145,7 @@ public:
     // Spawns the worker threads and kicks off execution loops
     void Start() {
         for (std::size_t i = 0; i < num_threads; ++i) {
-            workers.emplace_back(&WorkerPool::WorkerLoop, this, static_cast<int>(i), static_cast<std::uint32_t>(num_threads), std::move(worker_promise[i]));
+            workers.emplace_back(&WorkerPool::WorkerLoop, this, static_cast<int>(i), static_cast<std::uint32_t>(num_threads), std::move(worker_promise[i]), std::ref(policy));
         }
     }
 
