@@ -3,7 +3,6 @@
 #include <atomic>
 #include <cstdint>
 #include <array>
-#include "scoped_memory_lock.h"
 
 /**
  * @brief A lock-free, page-aligned data container structured as a bounded ring buffer.
