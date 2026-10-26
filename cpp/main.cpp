@@ -7,9 +7,10 @@
 #include <cassert>
 #include <algorithm>
 
+#include "ScopedMemoryLock.h"
 #include "SPMCqueue.h"
 #include "SPMCproducer.h"
-#include "worker_pool.h"
+#include "WorkerPool.h"
 
 // The user defines their custom business logic here
 struct RandomGeneratorPolicy
