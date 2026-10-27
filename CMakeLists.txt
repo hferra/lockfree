@@ -19,8 +19,19 @@ add_executable(lf_queue_test
     cpp/main.cpp
 )
 
+add_executable(obj_pool_test
+    cpp/testObjectPool.cpp
+)
+
 # Map the 'include' directory so main.cpp can find the header files
 target_include_directories(lf_queue_test PRIVATE include)
 
+target_include_directories(obj_pool_test PRIVATE include)
+
+
+
 # Link the system thread library explicitly to the binary
 target_link_libraries(lf_queue_test PRIVATE Threads::Threads)
+
+target_link_libraries(obj_pool_test PRIVATE Threads::Threads)
+

@@ -3,8 +3,16 @@
 #include <limits>
 #include <memory>
 #include <cstddef>
+#include <concepts>
 
-template <typename T, std::size_t PoolSize>
+// Define the contract: Type T must have a public Clear() method that returns void
+template<typename T>
+concept Clearable = requires(T a) {
+    { a.Clear() } -> std::same_as<void>;
+};
+
+
+template <Clearable T, std::size_t PoolSize>
 class LockFreeObjectPool {
 private:
     // Kept private: The client will never see this type
@@ -42,7 +50,7 @@ private:
 
 public:
     // Custom deleter that the unique_ptr will use automatically
-    class Deleter {
+    /*class Deleter {
     private:
         LockFreeObjectPool* pool_ptr;
         Node* node_ptr;
@@ -56,6 +64,25 @@ public:
             if (pool_ptr && node_ptr) {
                 // You could optionally call the destructor of T here if needed:
                 // ptr->~T();
+                pool_ptr->ReturnNode(node_ptr);
+            }
+        }
+    };*/
+    class Deleter {
+    private:
+        LockFreeObjectPool* pool_ptr;
+        Node* node_ptr;
+
+    public:
+        Deleter() : pool_ptr(nullptr), node_ptr(nullptr) {}
+        Deleter(LockFreeObjectPool* pool, Node* node) : pool_ptr(pool), node_ptr(node) {}
+
+        void operator()(T* ptr) const {
+            if (pool_ptr && node_ptr) {
+                // Secure Sanitisation Phase
+                ptr->Clear(); 
+
+                // Recycle back into the lock-free array
                 pool_ptr->ReturnNode(node_ptr);
             }
         }
