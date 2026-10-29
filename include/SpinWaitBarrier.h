@@ -73,9 +73,7 @@ class SpinWaitBarrier
     private:
         alignas(64) std::atomic<std::uint32_t> arrivedCount{0};
         std::uint32_t waitForCount;
-        alignas(64) std::atomic<std::uint32_t> finishedCount{0};
 
-        // Replace the boolean gate with an atomic generation index
         alignas(64) std::atomic<std::uint32_t> generation{0};
 
     public:
@@ -86,53 +84,35 @@ class SpinWaitBarrier
 
         void wait()
         {
-            // STEP 1: Capture the generation we are EXPECTING to process
+            // STEP 1: Capture the exact generation we are entering
             std::uint32_t currentGen = generation.load(std::memory_order_relaxed);
 
-            // STEP 2: Register arrival
-            arrivedCount.fetch_add(1, std::memory_order_acq_rel);
+            // STEP 2: Register arrival and get our atomic arrival ticket
+            std::uint32_t previousArrivals = arrivedCount.fetch_add(1, std::memory_order_acq_rel);
             
-            // If we are the final thread to arrive, we do NOT change a gate flag.
-            // We just wait for the master thread to tell us it's ready.
-            
-             // STEP 3: Spin with Oversubscription-Safe Yielding
-            std::uint32_t spinCount = 0;
-            while (arrivedCount.load(std::memory_order_acquire) < waitForCount)
-            {
-                if (spinCount < 2000) {
-                    _mm_pause(); 
-                }
-                else {
-                    // If we've spun 2000 times, someone else sharing our core is starving.
-                    // Yielding here lets a starving thread hop onto a Core and register its arrival!
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    spinCount = 0;
-                }
-                spinCount++;
+            // STEP 3: Check if WE are the final thread to arrive
+            if (previousArrivals + 1 == waitForCount)             
+            {                 
+                // We are the final thread! We implicitly handle the reset duties:
+                // 1. Reset the arrival counter for the NEXT generation
+                arrivedCount.store(0, std::memory_order_relaxed);
+                
+                // 2. Increment the generation index to release all waiting threads.
+                // A release fence ensures the store to arrivedCount happens before the generation flip.
+                generation.fetch_add(1, std::memory_order_release);
             }
-            
-            // STEP 4: Signal departure
-            finishedCount.fetch_add(1, std::memory_order_release);
-
-            // STEP 5: Prevention Gate
-            // If a fast worker loops around too early, it will hit this loop.
-            // Because 'generation' hasn't been incremented by the master yet,
-            // the fast worker safely spins here, unable to touch arrivedCount prematurely.
-
-            spinCount = 0;
-            while (generation.load(std::memory_order_acquire) == currentGen)
+            else
             {
-                if (spinCount < 2000) {
-                    _mm_pause();
-                } else {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    spinCount = 0;
+                // STEP 4: If we aren't the final thread, spin until the generation advances
+                // This means the final thread has arrived and cleared the phase.
+                while (generation.load(std::memory_order_acquire) == currentGen)
+                {
+                    _mm_pause();   
                 }
-                spinCount++;
             }
         }
 
-        void reset()
+        /*void reset()
         {
             // 1. Wait until all workers have completely checked out of the barrier phase
             while(finishedCount.load(std::memory_order_acquire) != waitForCount)
@@ -147,6 +127,6 @@ class SpinWaitBarrier
             // 3. Increment the generation. This releases the workers trapped in Step 5
             // and allows them to safely proceed to their next iteration.
             generation.fetch_add(1, std::memory_order_release);
-        }    
+        }*/    
 };
 
