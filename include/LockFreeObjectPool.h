@@ -1,6 +1,7 @@
+#pragma once 
 #include <array>
 #include <atomic>
-#include <limits>
+#include <cstdint>
 #include <memory>
 #include <cstddef>
 #include <concepts>
@@ -11,14 +12,39 @@ concept Clearable = requires(T a) {
     { a.Clear() } -> std::same_as<void>;
 };
 
+template <typename P>
+concept PoolPolicy = requires(P p) {
+    { p.OnPopSnapshot() } noexcept;   // after reading next, before the CAS
+    { p.OnCasRetry()    } noexcept;   // a CAS lost a race
+    { p.OnExhausted()   } noexcept;   // Lease() found the pool empty
+};
 
-template <Clearable T, std::size_t PoolSize>
+struct NoPolicy {
+    void OnPopSnapshot() noexcept {}
+    void OnCasRetry()    noexcept {}
+    void OnExhausted()   noexcept {}
+};
+
+
+// Note the LockFreeObjectPool must outlive any object that it Leases 
+template <Clearable T, std::size_t PoolSize, PoolPolicy Policy = NoPolicy>
 class LockFreeObjectPool {
 private:
+    [[no_unique_address]] Policy policy_;
+    static constexpr std::uint32_t kNull = 0xFFFFFFFFu;   // replaces size_t max
+
+    static constexpr std::uint64_t Pack(std::uint32_t tag, std::uint32_t idx) {
+        return (std::uint64_t{tag} << 32) | idx;           // tag in upper 32, index in lower 32
+    }
+    static constexpr std::uint32_t Index(std::uint64_t v) { return static_cast<std::uint32_t>(v & 0xFFFFFFFFu); }
+    static constexpr std::uint32_t Tag(std::uint64_t v)   { return static_cast<std::uint32_t>(v >> 32); }
+
+    static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
+
     // Kept private: The client will never see this type
     struct UnalignedNode {
         T storage;             
-        std::size_t next;      
+        std::atomic<std::uint32_t> next;      
     };
 
     // If the node is already larger than or equal to a cache line (64 bytes),
@@ -30,44 +56,28 @@ private:
 
     struct alignas(Alignment) Node {
         T storage;             
-        std::size_t next;      
+        std::atomic<std::uint32_t> next;      
     };
 
     std::array<Node, PoolSize> pool;
-    std::atomic<std::size_t> free_head{0};
+    std::atomic<std::uint64_t> free_head{Pack(0, 0)};
+
 
     // Internal raw Return that works with the index cached in 'next'
     void ReturnNode(Node* node_ptr) {
-        std::size_t node_idx = node_ptr->next; 
+        // Compute index via pointer arithmetic: avoids modifying node_ptr->next 
+        // during Lease(), eliminating a concurrent read/write race on 'next'.
+        const auto node_idx = static_cast<std::uint32_t>(node_ptr - pool.data());
 
-        std::size_t current_head = free_head.load(std::memory_order_acquire);
+        std::uint64_t current_head = free_head.load(std::memory_order_acquire);
         do {
-            node_ptr->next = current_head;
-        } while (!free_head.compare_exchange_weak(current_head, node_idx, 
+            node_ptr->next.store(Index(current_head), std::memory_order_relaxed);
+        } while (!free_head.compare_exchange_weak(current_head, Pack(Tag(current_head) + 1, node_idx), 
                                                   std::memory_order_release, 
                                                   std::memory_order_acquire));
     }
 
 public:
-    // Custom deleter that the unique_ptr will use automatically
-    /*class Deleter {
-    private:
-        LockFreeObjectPool* pool_ptr;
-        Node* node_ptr;
-
-    public:
-        Deleter() : pool_ptr(nullptr), node_ptr(nullptr) {}
-        Deleter(LockFreeObjectPool* pool, Node* node) : pool_ptr(pool), node_ptr(node) {}
-
-        // Triggered automatically when unique_ptr goes out of scope
-        void operator()(T*) const {
-            if (pool_ptr && node_ptr) {
-                // You could optionally call the destructor of T here if needed:
-                // ptr->~T();
-                pool_ptr->ReturnNode(node_ptr);
-            }
-        }
-    };*/
     class Deleter {
     private:
         LockFreeObjectPool* pool_ptr;
@@ -77,7 +87,7 @@ public:
         Deleter() : pool_ptr(nullptr), node_ptr(nullptr) {}
         Deleter(LockFreeObjectPool* pool, Node* node) : pool_ptr(pool), node_ptr(node) {}
 
-        void operator()(T* ptr) const {
+        void operator()(T* ptr) const noexcept {
             if (pool_ptr && node_ptr) {
                 // Secure Sanitisation Phase
                 ptr->Clear(); 
@@ -88,33 +98,53 @@ public:
         }
     };
 
+    const Policy& policy() const noexcept
+    { return policy_; }
+
     // Clean alias for the client: behaves exactly like a standard unique_ptr<T>
     using ObjectPtr = std::unique_ptr<T, Deleter>;
+    
+    // Default constructor for default-initializable policies (including NoPolicy & PauseAPolicy)
+    LockFreeObjectPool() requires std::default_initializable<Policy>
+        : LockFreeObjectPool(std::in_place) {}
 
-    LockFreeObjectPool() {
+
+    // In-place constructor for non-movable/non-copyable policies with arguments
+    template <typename... Args>
+    explicit LockFreeObjectPool(std::in_place_t, Args&&... args)
+        : policy_(std::forward<Args>(args)...)
+    {
+        static_assert(PoolSize > 0 && PoolSize < kNull);
         for (std::size_t i = 0; i < PoolSize - 1; ++i) {
-            pool[i].next = i + 1;
+            pool[i].next.store(static_cast<std::uint32_t>(i + 1), std::memory_order_relaxed);
         }
-        pool[PoolSize - 1].next = std::numeric_limits<std::size_t>::max();
+        pool[PoolSize - 1].next.store(kNull, std::memory_order_relaxed);
     }
 
-    ObjectPtr Lease() {
-        std::size_t current_head = free_head.load(std::memory_order_acquire);
-        while (current_head != std::numeric_limits<std::size_t>::max()) {
-            std::size_t next_free = pool[current_head].next;
+    [[nodiscard]] ObjectPtr Lease() {
+        std::uint64_t current_head = free_head.load(std::memory_order_acquire);
+        while (Index(current_head) != kNull) {
+            auto idx  = Index(current_head);
+            auto next = pool[idx].next.load(std::memory_order_relaxed);
+
+            policy_.OnPopSnapshot();
             
-            if (free_head.compare_exchange_weak(current_head, next_free, 
-                                                std::memory_order_release, 
+            if (free_head.compare_exchange_weak(current_head, Pack(Tag(current_head) + 1, next), 
+                                                std::memory_order_acq_rel, 
                                                 std::memory_order_acquire)) {
-                Node* leased_node = &pool[current_head];
+                Node* leased_node = &pool[idx];
                 
                 // Lock in its own index before handing it out
-                leased_node->next = current_head; 
+                leased_node->next.store(idx, std::memory_order_relaxed); 
 
                 // Return the smart pointer wrapping the internal storage payload
                 return ObjectPtr(&(leased_node->storage), Deleter(this, leased_node));
             }
+            // note the CAS above can fail spuriously so if OnCasRetry implements a retry count
+            // it could be an overestimate
+            policy_.OnCasRetry(); 
         }
+        policy_.OnExhausted();
         return nullptr; // Pool exhausted
     }
 };
