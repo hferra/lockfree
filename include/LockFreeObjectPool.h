@@ -1,3 +1,6 @@
+// Copyright 2026 Herman L. Ferra
+// SPDX-License-Identifier: Apache-2.0
+
 #pragma once 
 #include <array>
 #include <atomic>

@@ -1,5 +1,7 @@
-#pragma once
+// Copyright 2026 Herman L. Ferra
+// SPDX-License-Identifier: Apache-2.0
 
+#pragma once
 #include <sys/mman.h>
 #include <stdexcept>
 #include <system_error>
