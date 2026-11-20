@@ -1,121 +1,149 @@
-// Copyright 2026 Herman L. Ferra
-// SPDX-License-Identifier: Apache-2.0
+// Data-passing test for SpinWaitBarrier.
+//
+// Every worker writes a private data packet, waits at the barrier, then checks the packet written by
+// its left-hand neighbour. If the barrier lets a thread through early, or fails to order memory, a
+// check fails and the program exits non-zero. The checks are explicit rather than assert(), so they
+// still run in release builds.
+//
+// Also run this test under ThreadSanitizer. On x86 a missing acquire/release ordering can still pass
+// the value checks, but TSan reports the unsynchronised neighbour read as a data race.
+//
+// Usage: barrier_test [iterations]      (default 10000)
 
-#include <iostream>
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <iostream>
 #include <thread>
 #include <vector>
-#include <atomic>
-#include <cassert>
 #include <pthread.h>
 #include <sched.h>
 
 #include "SpinWaitBarrier.h"
 
-// Helper function to pin a thread to a specific physical core index
-void pin_thread_to_core(int core_id) {
+namespace {
+
+constexpr int kSlots = 7;                    // mock payload words per packet
+constexpr int kChecksPerIteration = 1 + kSlots;
+
+// Each worker owns one cache line, so the workers do not false-share.
+struct alignas(64) WorkerPacket {
+    std::uint64_t generation_stamp = 0;
+    std::uint64_t calculations[kSlots] = {};
+};
+
+// Per-worker tallies, also one cache line each.
+struct alignas(64) WorkerResult {
+    std::uint64_t checks = 0;
+    std::uint64_t mismatches = 0;
+};
+
+bool pin_thread_to_core(int core_id) {
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(core_id, &cpuset);
-    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    return pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) == 0;
 }
 
-int main() {
-    // ----------------------------------------------------
-    // CONFIGURATION (5 Workers pinned to Cores 1-5)
-    // ----------------------------------------------------
-    constexpr std::uint32_t ThreadCount = 5; 
-    constexpr int TotalIterations = 10000;   
+// The value worker `worker` publishes in iteration `iter` at slot `i`. The writer and the checker
+// both use this, so they cannot drift apart.
+std::uint64_t payload(int iter, std::uint32_t worker, int i) {
+    return static_cast<std::uint64_t>(iter) * 100 + worker + static_cast<std::uint64_t>(i);
+}
 
-    SpinWaitBarrier barrier(ThreadCount);
+} // namespace
+
+int main(int argc, char** argv) {
+    const int total_iterations = (argc > 1) ? std::max(1, std::atoi(argv[1])) : 10000;
+
+    // Prefer 5 workers on cores 1-5, leaving core 0 to the OS. On smaller machines use fewer
+    // workers, so a spinning barrier never has more threads than cores.
+    constexpr std::uint32_t kPreferredThreads = 5;
+    const std::uint32_t hw = std::thread::hardware_concurrency();
+    const std::uint32_t thread_count =
+        std::max<std::uint32_t>(2, std::min<std::uint32_t>(kPreferredThreads, hw > 1 ? hw - 1 : 1));
+    const bool can_pin = hw > thread_count;  // cores 1..thread_count must exist
+
+    SpinWaitBarrier barrier(thread_count);
     std::atomic<bool> master_start{false};
+    std::vector<WorkerPacket> shared_data_grid(thread_count);
+    std::vector<WorkerResult> results(thread_count);
+    std::atomic<std::uint32_t> pin_failures{0};
     std::vector<std::thread> workers;
 
-    // Shared Batch Data Packets
-    // Each worker gets a dedicated 64-byte aligned cache line to prevent false sharing
-    struct alignas(64) WorkerPacket {
-        uint64_t generation_stamp;
-        uint64_t calculations[7]; // Mock data payload
-    };
-    std::vector<WorkerPacket> shared_data_grid(ThreadCount);
-
-    // ----------------------------------------------------
-    // WORKER THREAD LOGIC
-    // ----------------------------------------------------
-    // Leave Core 0 unpinned to isolate OS kernel interrupts from the low-latency thread pool
-    for (std::uint32_t t = 0; t < ThreadCount; ++t) {
-        workers.emplace_back([&barrier, &master_start, &shared_data_grid, t, TotalIterations]() {
-            // Pin strictly to Cores 1-5, leaving Core 0 entirely for the Linux OS
-            pin_thread_to_core(t + 1);
-
-            while (!master_start.load(std::memory_order_relaxed)) {
+    for (std::uint32_t t = 0; t < thread_count; ++t) {
+        workers.emplace_back([&, t] {
+            if (can_pin && !pin_thread_to_core(static_cast<int>(t) + 1)) {
+                ++pin_failures;
+            }
+            while (!master_start.load(std::memory_order_acquire)) {
                 std::this_thread::yield();
             }
 
-            for (int iter = 0; iter < TotalIterations; ++iter) {
-                // ------------------------------------------------
-                // PHASE 1: Write Private Data Packet
-                // ------------------------------------------------
-                // Worker 't' exclusively owns and writes to row 't'.
-                // We use the current loop iteration as a unique mathematical signature.
-                shared_data_grid[t].generation_stamp = iter;
-                for (int i = 0; i < 7; ++i) {
-                    shared_data_grid[t].calculations[i] = (iter * 100) + t + i;
+            std::uint64_t checks = 0, mismatches = 0;
+            const std::uint32_t neighbour = (t == 0) ? thread_count - 1 : t - 1;
+
+            for (int iter = 0; iter < total_iterations; ++iter) {
+                // Phase 1: write this worker's private packet.
+                shared_data_grid[t].generation_stamp = static_cast<std::uint64_t>(iter);
+                for (int i = 0; i < kSlots; ++i) {
+                    shared_data_grid[t].calculations[i] = payload(iter, t, i);
                 }
 
-                // --- THE SYNCHRONIZATION BARRIER ---
-                // This forces all memory writes to complete and flushes the 
-                // modified cache lines across the CPU interconnect ring bus.
                 barrier.wait();
 
-                // ------------------------------------------------
-                // PHASE 2: Cross-Thread Data Verification
-                // ------------------------------------------------
-                // Because the barrier passed, it is now legally safe to read 
-                // data from ANY other thread's row. Let's check our left neighbor.
-                uint32_t neighbor = (t == 0) ? (ThreadCount - 1) : (t - 1);
-                
-                // Assert that the neighbor has fully completed the exact same iteration
-                assert(shared_data_grid[neighbor].generation_stamp == static_cast<uint64_t>(iter) && 
-                       "CRITICAL ERROR: Memory reordering or race condition detected!");
-
-                // Verify the mathematical payload written by the neighbor
-                for (int i = 0; i < 7; ++i) {
-                    uint64_t expected_val = (iter * 100) + neighbor + i;
-                    assert(shared_data_grid[neighbor].calculations[i] == expected_val && 
-                           "CRITICAL ERROR: Data corruption or dirty cache read!");
+                // Phase 2: after the barrier it is safe to read the neighbour's packet.
+                const WorkerPacket& n = shared_data_grid[neighbour];
+                ++checks;
+                if (n.generation_stamp != static_cast<std::uint64_t>(iter)) ++mismatches;
+                for (int i = 0; i < kSlots; ++i) {
+                    ++checks;
+                    if (n.calculations[i] != payload(iter, neighbour, i)) ++mismatches;
                 }
 
-                // --- ANTI-OVERRUN GATE ---
-                // We wait again to prevent incredibly fast threads from looping back
-                // and destroying their data before slow threads finish reading it.
+                // Second barrier: stops a fast thread from looping round and overwriting its packet
+                // before a slow neighbour has finished reading it.
                 barrier.wait();
             }
+            results[t].checks = checks;
+            results[t].mismatches = mismatches;
         });
     }
 
-    // ----------------------------------------------------
-    // RUN BENCHMARK
-    // ----------------------------------------------------
-    std::cout << "Starting DECENTRALIZED Data-Passing Test (5 workers on Cores 1-5)..." << std::endl;
-    auto start_time = std::chrono::high_resolution_clock::now();
-    
-    master_start.store(true, std::memory_order_release); // Release the pack
+    std::cout << "Barrier data-passing test: " << thread_count << " workers, " << total_iterations
+              << " iterations" << (can_pin ? ", pinned to cores 1-" + std::to_string(thread_count) : ", not pinned")
+              << std::endl;
+    const auto start_time = std::chrono::high_resolution_clock::now();
+    master_start.store(true, std::memory_order_release);
+    for (auto& w : workers) w.join();
+    const auto end_time = std::chrono::high_resolution_clock::now();
+    const std::chrono::duration<double, std::milli> elapsed = end_time - start_time;
 
-    for (auto& worker : workers) {
-        worker.join();
+    std::uint64_t checks = 0, mismatches = 0;
+    for (const auto& r : results) {
+        checks += r.checks;
+        mismatches += r.mismatches;
     }
-    
-    auto end_time = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> elapsed_time = end_time - start_time;
+    const std::uint64_t expected_checks =
+        static_cast<std::uint64_t>(total_iterations) * thread_count * kChecksPerIteration;
 
-    std::cout << "\n================ DATA TEST RESULTS ================" << std::endl;
-    std::cout << "Total Run Time:        " << elapsed_time.count() << " ms" << std::endl;
-    std::cout << "Completed Generations: " << TotalIterations << std::endl;
-    std::cout << "Total Data Verifications: " << TotalIterations * ThreadCount * 8 << " successful passes" << std::endl;
-    std::cout << "Average Step Latency:   " << (elapsed_time.count() * 1000000.0) / (TotalIterations * 2) << " ns (Includes 2 barriers per cycle)" << std::endl;
-    std::cout << "===================================================" << std::endl;
-    std::cout << "Verification: PASSED! (Perfect data integrity, zero races)" << std::endl;
+    std::cout << "\n================ BARRIER TEST RESULTS ================\n"
+              << "Total run time:        " << elapsed.count() << " ms\n"
+              << "Barrier crossings:     " << static_cast<std::uint64_t>(total_iterations) * 2 << "\n"
+              << "Average per crossing:  " << (elapsed.count() * 1e6) / (total_iterations * 2.0) << " ns\n"
+              << "Checks performed:      " << checks << " (expected " << expected_checks << ")\n"
+              << "Mismatches:            " << mismatches << "\n";
+    if (pin_failures.load() != 0) {
+        std::cout << "Warning: " << pin_failures.load() << " thread(s) could not be pinned\n";
+    }
+    std::cout << "======================================================\n";
 
+    if (mismatches != 0 || checks != expected_checks) {
+        std::cout << "Verification: FAILED\n";
+        return 1;
+    }
+    std::cout << "Verification: PASSED (all " << checks << " checks)\n";
     return 0;
 }
