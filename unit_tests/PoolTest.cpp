@@ -4,6 +4,8 @@
 #include <gtest/gtest.h>
 #include <atomic>
 #include <thread>
+#include <unordered_set>
+#include <vector>
 #include "LockFreeObjectPool.h"
 
 
@@ -60,3 +62,55 @@ TEST_F(PoolTest, ABA)
     ASSERT_NE(b1.get(), c.get());
 }
 
+// Payload for the contention test: each lessee writes a token unique to it and checks, after
+// yielding, that nobody else touched the object while it was held.
+struct TokenObj
+{
+    long token = 0;
+    void Clear() { token = 0; }
+};
+
+// A sanity check under real contention, not the guard for the ABA bug (PoolTest.ABA is that).
+// It is most useful when built with ThreadSanitizer (-DENABLE_TSAN=ON).
+TEST_F(PoolTest, ExclusiveOwnershipUnderContention)
+{
+    constexpr int kThreads = 8;
+    constexpr int kIterations = 50'000;
+    LockFreeObjectPool<TokenObj, 4> pool;
+    std::atomic<long> violations{0}, leases{0};
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t)
+    {
+        threads.emplace_back([&pool, &violations, &leases, t] {
+            for (int i = 0; i < kIterations; ++i)
+            {
+                auto obj = pool.Lease();
+                if (!obj) continue;               // pool momentarily empty: more threads than nodes
+                const long token = (static_cast<long>(t) << 32) | i;
+                obj->token = token;
+                std::this_thread::yield();        // widen the window in which an overlap would show
+                if (obj->token != token) ++violations;
+                ++leases;
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+
+    EXPECT_EQ(violations.load(), 0);
+    EXPECT_GT(leases.load(), 0);
+
+    // all four nodes must still be recoverable, and distinct
+    using P = decltype(pool)::ObjectPtr;
+    std::vector<P> held;
+    std::unordered_set<const TokenObj*> distinct;
+    for (int i = 0; i < 4; ++i)
+    {
+        held.push_back(pool.Lease());
+        ASSERT_NE(held.back().get(), nullptr);
+        distinct.insert(held.back().get());
+    }
+    EXPECT_EQ(distinct.size(), 4u);
+    auto extra = pool.Lease();
+    EXPECT_EQ(extra.get(), nullptr);              // pool is empty again
+}
