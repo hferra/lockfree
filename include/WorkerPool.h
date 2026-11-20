@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <immintrin.h> // Required for _mm_pause
 #include <concepts>
-#include "SPMCqueue.h"
+#include "SPMCQueue.h"
 
 // Define a C++20 concept to enforce your library's interface at compile-time
 template<typename T>

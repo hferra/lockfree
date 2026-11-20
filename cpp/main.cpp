@@ -11,8 +11,8 @@
 #include <algorithm>
 
 #include "ScopedMemoryLock.h"
-#include "SPMCqueue.h"
-#include "SPMCproducer.h"
+#include "SPMCQueue.h"
+#include "SPMCProducer.h"
 #include "WorkerPool.h"
 
 // The user defines their custom business logic here
