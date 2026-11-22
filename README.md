@@ -1,4 +1,5 @@
 # lockfree
+![CI](https://github.com/hferra/lockfree/actions/workflows/ci.yml/badge.svg)
 
 Small C++20 library and benchmarks for low-latency, lock-free building blocks on Linux/x86-64:
 a bounded single-producer/multi-consumer (SPMC) queue, a fixed-size object pool and a spin barrier.
