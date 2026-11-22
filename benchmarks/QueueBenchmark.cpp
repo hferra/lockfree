@@ -7,7 +7,6 @@
 #include <chrono>
 #include <random>
 #include <pthread.h> // For thread affinity on Linux
-#include <cassert>
 #include <algorithm>
 
 #include "ScopedMemoryLock.h"
@@ -107,7 +106,11 @@ int main() {
             timings.push_back(elapsed);
 
             //std::cout << "Benchmark complete! Elapsed time: " << elapsed << " ms" << std::endl;
-            assert(totalWork == workDone);
+           if (totalWork != workDone) {
+                std::cerr << "ERROR: producer published " << totalWork
+                << " items but consumers processed " << workDone << "\n";
+                return 1;
+            }
             
         } // <-- queue_lock automatically goes out of scope here and calls munlock()!
     }
