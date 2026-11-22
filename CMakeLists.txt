@@ -31,14 +31,14 @@ enable_testing()
 include(GoogleTest)
 
 # --- Benchmark Executables ---
-add_executable(lf_queue_test
-    cpp/main.cpp
+add_executable(queue_benchmark
+    benchmarks/QueueBenchmark.cpp
 )
-target_include_directories(lf_queue_test PRIVATE include)
-target_link_libraries(lf_queue_test PRIVATE Threads::Threads)
+target_include_directories(queue_benchmark PRIVATE include)
+target_link_libraries(queue_benchmark PRIVATE Threads::Threads)
 
 add_executable(barrier_test
-    cpp/testBarrier.cpp
+    unit_tests/BarrierTest.cpp
 )
 target_include_directories(barrier_test PRIVATE include)
 target_link_libraries(barrier_test PRIVATE Threads::Threads)
