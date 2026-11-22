@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Default build
+            cmake_args: ""
+          - name: ThreadSanitizer
+            cmake_args: "-DENABLE_TSAN=ON"
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Newer kernels use more address-space randomisation than ThreadSanitizer supports, which
+      # makes it abort at start-up with "unexpected memory mapping". Lowering it is a known fix.
+      - name: Lower ASLR entropy for ThreadSanitizer
+        if: matrix.name == 'ThreadSanitizer'
+        run: sudo sysctl -w vm.mmap_rnd_bits=28 || true
+
+      - name: Configure
+        run: cmake -B build ${{ matrix.cmake_args }}
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
